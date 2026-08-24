@@ -27,6 +27,8 @@ Authors: Sebastian Deorowicz, Agnieszka Debudaj-Grabysz, Adam Gudys
 #include <list>
 #include <stack>
 #include <thread>
+#include <atomic>
+#include <exception>
 #include <memory>
 
 #include <iostream>
@@ -715,4 +717,244 @@ bool CFAMSA::alignProfiles(vector<CGappedSequence>& p1, vector<CGappedSequence>&
 	}
 
 	return 0;
+}
+
+// *******************************************************************
+// Add unaligned fragments to an existing (fixed) reference alignment.
+//
+// Strategy (fixed-reference placement, no clustering / no pre-alignment of the
+// fragments among themselves):
+//   * each fragment is placed independently against the pristine reference using
+//     the existing sequence-to-profile aligner (reached via the profile-profile
+//     constructor when one side is a single sequence);
+//   * the reference columns are preserved, so a column that is a gap in *every*
+//     reference row is an insertion introduced by the fragment;
+//   * by default those insertion columns are dropped (reference length preserved,
+//     MAFFT --keeplength style); with -keep_insertions they are kept, stacking the
+//     insertions from different fragments at the same reference slot (MAX columns per slot).
+//
+// The reference alignment is never refined or otherwise modified.
+//
+// NOTE (performance): this v1 rebuilds and re-scores a copy of the reference for
+// every fragment because the profile merge consumes (mutates) its inputs. That is
+// O(reference_size x width) per fragment. A non-destructive placement primitive
+// (run the DP + traceback against the reference's precomputed scores/counters and
+// read off the path) would remove the per-fragment copy; see docs/add-mode-design.md.
+bool CFAMSA::addFragments(vector<CGappedSequence>& reference, vector<CGappedSequence>& fragments)
+{
+	timers[TIMER_ALIGNMENT].StartTimer();
+	LOG_VERBOSE << "Adding " << fragments.size() << " fragment(s) to a reference alignment of "
+		<< reference.size() << " sequence(s)...";
+
+	const size_t ref_width = reference.front().gapped_size;
+
+	// each fragment placed against the reference: its residues at the reference columns
+	// (projection) plus the residues it inserts, grouped by the reference "slot" they fall
+	// into (slot s = after reference column s; slot 0 = before the first column).
+	struct PlacedFragment {
+		string id;
+		string projection;                         // ref_width chars
+		vector<pair<uint32_t, string>> insertions; // sparse, ascending slot in [0, ref_width]
+	};
+	// the reference is scored once; each fragment gets its own copy of the rows and these scores
+	CProfile ref_master(&params);
+	for (const auto& gs : reference)
+		ref_master.AppendRawSequence(gs);
+	ref_master.CalculateCountersScores();
+
+	// place fragment f into pf; false for an empty fragment
+	auto place = [&](size_t f, refresh::active_thread_pool_v2& local_atp, PlacedFragment& pf) -> bool {
+		const CGappedSequence& frag_gs = fragments[f];
+		if (frag_gs.size == 0)
+			return false;
+		const string frag_id = frag_gs.id;
+
+		// single-sequence profile for the fragment (the ctor also computes its counters/scores)
+		CProfile frag_prof(frag_gs, &params);
+		CGappedSequence* frag_ptr = frag_prof.data.front();
+
+		// the merge consumes (mutates) its inputs: a fresh copy of the reference rows, with the
+		// counters/scores computed once above instead of recalculated per fragment
+		CProfile ref_copy(&params);
+		ref_copy.data.reserve(ref_master.data.size());
+		for (const CGappedSequence* row : ref_master.data)
+			ref_copy.data.push_back(new CGappedSequence(*row));
+		ref_copy.width = ref_master.width;
+		ref_copy.counters = ref_master.counters;
+		ref_copy.scores = ref_master.scores;
+
+		// place the fragment against the reference (dispatches to the seq-to-profile DP)
+		CProfile merged(&ref_copy, &frag_prof, &params, 1, 4, &local_atp);
+
+		// locate the aligned fragment row in the merged profile. The profile merge preserves
+		// each row's object and id, so match on the pointer first, then fall back to the id.
+		CGappedSequence* frag_row = nullptr;
+		for (CGappedSequence* row : merged.data) {
+			if (row == frag_ptr || row->id == frag_id) {
+				frag_row = row;
+				break;
+			}
+		}
+		if (frag_row == nullptr) {
+			string sample;
+			for (size_t k = 0; k < merged.data.size() && k < 4; ++k)
+				sample += " [" + merged.data[k]->id + "]";
+			throw std::runtime_error("Internal error placing fragment '" + frag_id + "': not found in "
+				+ std::to_string(merged.data.size()) + " merged rows (reference has "
+				+ std::to_string(reference.size()) + "); sample ids:" + sample);
+		}
+
+		// decode merged rows; an insertion column is a gap in *every* reference row
+		string frag_decoded;
+		size_t merged_width = 0;
+		vector<char> ref_has_residue;
+		for (CGappedSequence* row : merged.data) {
+			string dec = row->Decode();
+			if (merged_width == 0) {
+				merged_width = dec.size();
+				ref_has_residue.assign(merged_width, 0);
+			}
+			if (row == frag_row) {
+				frag_decoded = std::move(dec);
+			}
+			else {
+				for (size_t c = 0; c < merged_width; ++c)
+					if (dec[c] != '-')
+						ref_has_residue[c] = 1;
+			}
+		}
+
+		// split the fragment into its residues at reference columns (projection) and its
+		// insertions, grouped by the reference slot they fall into
+		pf.id = frag_id;
+		pf.projection.reserve(ref_width);
+		uint32_t ref_seen = 0;
+		string cur_ins;
+		for (size_t c = 0; c < merged_width; ++c) {
+			if (ref_has_residue[c]) {
+				if (!cur_ins.empty()) {
+					pf.insertions.emplace_back(ref_seen, std::move(cur_ins));
+					cur_ins.clear();
+				}
+				pf.projection.push_back(frag_decoded[c]);
+				++ref_seen;
+			}
+			else {
+				cur_ins.push_back(frag_decoded[c]);
+			}
+		}
+		if (!cur_ins.empty())
+			pf.insertions.emplace_back(ref_seen, std::move(cur_ins));
+
+		if (pf.projection.size() != ref_width) {
+			throw std::runtime_error("Reference alignment appears to contain all-gap columns; "
+				"please remove them (e.g. with -trim_columns) before adding fragments.");
+		}
+		return true;
+	};
+
+	// fragments are independent: workers take the next one and write it to its own slot,
+	// so the output order (and content) does not depend on the thread count
+	vector<PlacedFragment> slots(fragments.size());
+	vector<char> filled(fragments.size(), 0);
+	std::atomic<size_t> next_frag{ 0 };
+	std::exception_ptr failure = nullptr;
+	std::mutex failure_mtx;
+	const size_t n_workers = std::max<size_t>(1, std::min<size_t>(params.n_threads, fragments.size()));
+	vector<thread> workers;
+	for (size_t w = 0; w < n_workers; ++w)
+		workers.emplace_back([&] {
+			refresh::active_thread_pool_v2 local_atp(1, 1);
+			for (size_t f = next_frag++; f < fragments.size(); f = next_frag++) {
+				try {
+					filled[f] = place(f, local_atp, slots[f]);
+				}
+				catch (...) {
+					std::lock_guard<std::mutex> lck(failure_mtx);
+					if (!failure)
+						failure = std::current_exception();
+					next_frag = fragments.size();
+				}
+			}
+		});
+	for (auto& t : workers)
+		t.join();
+	if (failure)
+		std::rethrow_exception(failure);
+
+	vector<PlacedFragment> placed;
+	placed.reserve(fragments.size());
+	for (size_t f = 0; f < fragments.size(); ++f) {
+		if (filled[f])
+			placed.push_back(std::move(slots[f]));
+		else
+			LOG_VERBOSE << "\n  skipping empty fragment " << fragments[f].id;
+	}
+
+	// consolidate insertions across all fragments. With -keep_insertions we keep them, taking
+	// the MAX number of inserted columns needed at each reference slot (insertions from
+	// different fragments at the same slot are stacked/left-justified into shared columns).
+	// Without the flag every slot stays 0 and the insertions are dropped (keeplength).
+	vector<size_t> max_ins(ref_width + 1, 0);
+	if (params.keep_insertions)
+		for (const auto& pf : placed)
+			for (const auto& ins : pf.insertions)
+				max_ins[ins.first] = std::max(max_ins[ins.first], ins.second.size());
+
+	const size_t total_ins = std::accumulate(max_ins.begin(), max_ins.end(), (size_t)0);
+	const size_t final_width = ref_width + total_ins;
+
+	// assemble the final alignment: reference rows first, then the placed fragments, all
+	// interleaving reference columns with the consolidated per-slot insertion blocks.
+	final_profile = new CProfile(&params);
+
+	for (auto& gs : reference) {
+		if (total_ins == 0) {
+			final_profile->AppendRawSequence(gs);          // keeplength: reference untouched
+			continue;
+		}
+		string ref_chars = gs.Decode();                    // ref_width chars
+		string row;
+		row.reserve(final_width);
+		for (size_t slot = 0; slot <= ref_width; ++slot) {
+			if (max_ins[slot])
+				row.append(max_ins[slot], '-');
+			if (slot < ref_width)
+				row.push_back(ref_chars[slot]);
+		}
+		final_profile->AppendRawSequence(CGappedSequence(gs.id, row));
+	}
+
+	for (auto& pf : placed) {
+		if (total_ins == 0) {
+			final_profile->AppendRawSequence(CGappedSequence(pf.id, pf.projection));
+			continue;
+		}
+		string row;
+		row.reserve(final_width);
+		size_t next = 0;   // next insertion of this fragment (insertions are slot-ascending)
+		for (size_t slot = 0; slot <= ref_width; ++slot) {
+			if (max_ins[slot]) {
+				size_t have = 0;
+				if (next < pf.insertions.size() && pf.insertions[next].first == slot) {
+					row.append(pf.insertions[next].second);
+					have = pf.insertions[next].second.size();
+					++next;
+				}
+				row.append(max_ins[slot] - have, '-');
+			}
+			if (slot < ref_width)
+				row.push_back(pf.projection[slot]);
+		}
+		final_profile->AppendRawSequence(CGappedSequence(pf.id, row));
+	}
+
+	LOG_VERBOSE << " [OK]" << endl;
+	timers[TIMER_ALIGNMENT].StopTimer();
+
+	if (params.verbose_mode || params.very_verbose_mode) {
+		statistics.put("time.alignment", timers[TIMER_ALIGNMENT].GetElapsedTime());
+	}
+
+	return true;
 }

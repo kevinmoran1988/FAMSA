@@ -69,6 +69,46 @@ int main(int argc, char *argv[])
 		vector<CGappedSequence*> result;
 		vector<CSequence> sequences;
 
+		// add unaligned fragments to an existing alignment
+		if (params.add_fragments) {
+			if (!params.input_file_name_2.empty()) {
+				throw std::runtime_error("Usage: famsa -addfragments <fragments> <reference_alignment> <output>");
+			}
+
+			LOG_VERBOSE << "Adding fragments from " << params.fragments_file_name
+				<< " into alignment " << params.input_file_name << "\n";
+
+			// NOTE: loaded without the monotonic allocator (mma) on purpose - addFragments
+			// allocates and frees a fresh copy of the reference for every fragment, and a
+			// monotonic allocator would never reclaim those between fragments.
+			vector<CGappedSequence> reference;
+			size_t ref_size = IOService::loadFasta(params.input_file_name, reference);
+			bool correct = (ref_size > 0) && std::all_of(reference.begin(), reference.end(),
+				[&reference](const CGappedSequence& seq) {
+					return seq.gapped_size == reference.front().gapped_size;
+				});
+			if (!correct) {
+				throw std::runtime_error("Incorrect reference alignment (sequences must be aligned to equal length)");
+			}
+
+			// fragments are unaligned; loaded as CGappedSequence (gap-free) so they share the
+			// exact same guard/symbol convention as the reference rows.
+			vector<CGappedSequence> fragments;
+			size_t frag_size = IOService::loadFasta(params.fragments_file_name, fragments);
+			if (frag_size == 0) {
+				throw std::runtime_error("No (or incorrect) fragments file");
+			}
+
+			CFAMSA famsa(params);
+			famsa.adjustParams((int)(ref_size + frag_size));
+			famsa.addFragments(reference, fragments);
+			famsa.GetAlignment(result);
+
+			IOService::saveAlignment(params.output_file_name, result, params.n_threads,
+				params.gzippd_output ? params.gzip_level : -1, params.remove_rare_columns ? params.rare_column_threshold : 1.0f);
+			return 0;
+		}
+
 		// profile - profile alignment
 		if (params.profile_aligning) {
 			LOG_VERBOSE << "Aligning " << params.input_file_name << " with " << params.input_file_name_2 << "\n";

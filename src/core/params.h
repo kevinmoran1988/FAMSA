@@ -133,6 +133,12 @@ public:
 	string input_file_name_2;
 	string output_file_name;
 
+	// add unaligned sequences to an existing alignment (MAFFT --addfragments style)
+	bool add_fragments = false;
+	string fragments_file_name;
+	// keep fragment insertions (add new columns) instead of preserving the reference length
+	bool keep_insertions = false;
+
 	string seed_file_name;
 	string stats_file_name;
 

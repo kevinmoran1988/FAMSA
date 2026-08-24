@@ -110,6 +110,9 @@ public:
 	bool ComputeMSA(vector<CSequence>& sequences);
 
 	bool alignProfiles(vector<CGappedSequence>& p1, vector<CGappedSequence>& p2);
+
+	// Add unaligned fragments to an existing (fixed) reference alignment.
+	bool addFragments(vector<CGappedSequence>& reference, vector<CGappedSequence>& fragments);
 };
 
 

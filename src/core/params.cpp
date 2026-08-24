@@ -103,6 +103,14 @@ void CParams::show_usage(bool expert)
 		<< "  -keep_duplicates - keep duplicated sequences during alignment\n"
 		<< "                     (default: disabled - duplicates are removed prior and restored after the alignment).\n\n"
 
+		<< "  -addfragments <file> - add the unaligned sequences from <file> into the existing alignment given\n"
+		<< "                         as <input_file>. The reference alignment is kept fixed and its length is\n"
+		<< "                         preserved (residues that would be inserted between reference columns are\n"
+		<< "                         removed). Usage: famsa -addfragments <fragments> <reference_aln> <output>\n"
+		<< "  -keep_insertions - with -addfragments, keep the residues that fall between reference columns by\n"
+		<< "                     adding new columns (insertions from different fragments at the same position\n"
+		<< "                     are stacked). Default: disabled (reference length is preserved).\n\n"
+
 		<< "  -gz - enable gzipped output (default: " << bool2str[gzippd_output] << ")\n"
 		<< "  -gz_lev <value> - gzip compression level [0-9] (default: " << gzip_level << ")\n"
 		<< "  -trim_columns <fraction> - remove columns with less <fraction> of non-gap characters\n"
@@ -262,7 +270,13 @@ bool CParams::parse(int argc, char** argv, bool& showExpert)
 	very_verbose_mode = findSwitch(params, "-vv");
 
 	findOption(params, "-stats", stats_file_name);
-	
+
+	// add unaligned sequences from <file> to the reference alignment (input_file).
+	// Consume the -keep_insertions switch FIRST so that findOption for -addfragments cannot
+	// mistake it for the filename value when written as "-addfragments -keep_insertions <file>".
+	keep_insertions = findSwitch(params, "-keep_insertions");
+	add_fragments = findOption(params, "-addfragments", fragments_file_name);
+
 	// remaining parameters are positionals
 	if (params.size() < 2 || params.size() > 3) {
 		return false;
