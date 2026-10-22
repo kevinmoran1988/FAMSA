@@ -179,6 +179,8 @@ void CProfile::AlignSeqProf(CProfile* profile1, CProfile* profile2, vector<int>*
 	score_t gap_ext = params->gap_ext;
 	score_t gap_term_open = params->gap_term_open;
 	score_t gap_term_ext = params->gap_term_ext;
+	// profile1 is the single sequence: with free_fragment_end_gaps its own end gaps cost nothing
+	const bool free_ends = params->free_fragment_end_gaps;
 
 	CDPMatrix matrix(prof1_width + 1, prof2_width + 1);
 	matrix.set_zeros(params->instruction_set);
@@ -224,7 +226,7 @@ void CProfile::AlignSeqProf(CProfile* profile1, CProfile* profile2, vector<int>*
 		prev_row[1].D = -infty;
 
 		//prev_row[1].H = prev_row[0].D + prof2_gaps[1].term_open * prof1_card;
-		prev_row[1].H = prev_row[0].D + prof2_gaps[1].term_open;
+		prev_row[1].H = prev_row[0].D + (free_ends ? 0 : prof2_gaps[1].term_open);
 
 		prev_row[1].V = -infty;
 		matrix.set_dir_all(0, 1, direction_t::H);
@@ -235,7 +237,7 @@ void CProfile::AlignSeqProf(CProfile* profile1, CProfile* profile2, vector<int>*
 	{
 		prev_row[j].D = -infty;
 
-		prev_row[j].H = prev_row[j - 1].H + prof2_gaps[j].term_ext;
+		prev_row[j].H = prev_row[j - 1].H + (free_ends ? 0 : prof2_gaps[j].term_ext);
 
 		prev_row[j].V = -infty;
 		matrix.set_dir_all(0, j, direction_t::H);
@@ -367,11 +369,11 @@ void CProfile::AlignSeqProf(CProfile* profile1, CProfile* profile2, vector<int>*
 
 			//the case when a column (i) was aligned with the column (j-1)
 
-			score_t gap_corr = (i < prof1_width ? prof2_gaps[j].open : prof2_gaps[j].term_open);
+			score_t gap_corr = (i < prof1_width ? prof2_gaps[j].open : (free_ends ? 0 : prof2_gaps[j].term_open));
 			t_D = ptr_curr_row->D + gap_corr;
 
 			//the case when a sequence of gaps is continued (another columnn of gaps is inserted)
-			t_H = ptr_curr_row->H + (i < prof1_width ? prof2_gaps[j].ext : prof2_gaps[j].term_ext);
+			t_H = ptr_curr_row->H + (i < prof1_width ? prof2_gaps[j].ext : (free_ends ? 0 : prof2_gaps[j].term_ext));
 
 #ifdef ALWAYS_3_DIRS
 			//the column of gaps is inserted into the profile 1 after a column of gaps in the profile 2

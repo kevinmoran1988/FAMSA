@@ -138,6 +138,8 @@ public:
 	string fragments_file_name;
 	// keep fragment insertions (add new columns) instead of preserving the reference length
 	bool keep_insertions = false;
+	// -addfragments: a fragment's leading/trailing gaps (reference columns it does not cover) are free
+	bool free_fragment_end_gaps = false;
 
 	string seed_file_name;
 	string stats_file_name;

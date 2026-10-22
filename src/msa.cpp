@@ -756,6 +756,9 @@ bool CFAMSA::addFragments(vector<CGappedSequence>& reference, vector<CGappedSequ
 		string projection;                         // ref_width chars
 		vector<pair<uint32_t, string>> insertions; // sparse, ascending slot in [0, ref_width]
 	};
+	// a fragment covers part of the reference: its own end gaps are free (the reference's are not)
+	params.free_fragment_end_gaps = true;
+
 	// the reference is scored once; each fragment gets its own copy of the rows and these scores
 	CProfile ref_master(&params);
 	for (const auto& gs : reference)
